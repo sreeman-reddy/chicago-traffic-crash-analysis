@@ -1,0 +1,233 @@
+---
+title: "Traffic Crash Data Model"
+output: rmarkdown::github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.path = "traffic_crash_model_figures/")
+```
+
+```{r}
+library(tidyverse)
+library(gamlr)
+library(parallel)
+library(distrom)
+library(caret)
+library(pROC)
+library(xgboost)
+set.seed(480)
+```
+
+```{r}
+xnaref <- function(x){
+	if(is.factor(x))
+		if(!is.na(levels(x)[1]))
+			x <- factor(x,levels=c(NA,levels(x)),exclude=NULL)
+	return(x) }
+
+naref <- function(DF){
+	if(is.null(dim(DF))) return(xnaref(DF))
+	if(!is.data.frame(DF)) 
+		stop("You need to give me a data.frame or a factor")
+	DF <- lapply(DF, xnaref)
+	return(as.data.frame(DF))
+}
+
+roc <- function(p,y, ...){
+  y <- factor(y)
+  n <- length(p)
+  p <- as.vector(p)
+  Q <- p > matrix(rep(seq(0,1,length=100),n),ncol=100,byrow=TRUE)
+  specificity <- colMeans(!Q[y==levels(y)[1],])
+  sensitivity <- colMeans(Q[y==levels(y)[2],])
+  plot(1-specificity, sensitivity, type="l", ...)
+  abline(a=0,b=1,lty=2,col=8)
+}
+```
+
+```{r}
+df <- read_csv("Traffic_Crashes_-_Crashes_20241108.csv")
+drops <- c("CRASH_DATE_EST_I","LANE_CNT","INTERSECTION_RELATED_I",
+           "NOT_RIGHT_OF_WAY_I","HIT_AND_RUN_I","PHOTOS_TAKEN_I",
+           "STATEMENTS_TAKEN_I","DOORING_I","WORK_ZONE_I",
+           "WORK_ZONE_TYPE","WORKERS_PRESENT_I", "STREET_DIRECTION",
+           "STREET_NAME", "STREET_NO", "REPORT_TYPE","BEAT_OF_OCCURRENCE",
+           "NUM_UNITS","INJURIES_UNKNOWN","LOCATION")
+df <- df[ , !(names(df) %in% drops)]
+df <- df %>% drop_na(c(LATITUDE,MOST_SEVERE_INJURY))
+df$CRASH_DATE <- as.Date(df$CRASH_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+df$DATE_POLICE_NOTIFIED <- as.Date(df$DATE_POLICE_NOTIFIED, format = "%m/%d/%Y %I:%M:%S %p")
+df <- df %>%
+  mutate(SEASON = case_when(
+    CRASH_MONTH %in% c(12, 1, 2) ~ 'WINTER',
+    CRASH_MONTH %in% c(3, 4, 5) ~ 'SPRING',
+    CRASH_MONTH %in% c(6, 7, 8) ~ 'SUMMER',
+    CRASH_MONTH %in% c(9, 10, 11) ~ 'FALL'
+  ))
+df <- df %>% filter(LATITUDE != 0)
+
+factor_cols <- c("TRAFFIC_CONTROL_DEVICE","DEVICE_CONDITION","WEATHER_CONDITION",
+                 "LIGHTING_CONDITION","FIRST_CRASH_TYPE","TRAFFICWAY_TYPE",
+                 "ALIGNMENT","ROADWAY_SURFACE_COND","ROAD_DEFECT","CRASH_TYPE",
+                 "DAMAGE","PRIM_CONTRIBUTORY_CAUSE","SEC_CONTRIBUTORY_CAUSE",
+                 "MOST_SEVERE_INJURY","CRASH_HOUR","CRASH_DAY_OF_WEEK","CRASH_MONTH",
+                 "SEASON")
+df[factor_cols] <- lapply(df[factor_cols], factor)
+# df <- naref(df)
+pca_ll <- prcomp(df[,c("LATITUDE","LONGITUDE")], center=TRUE, scale.=TRUE, )
+df$PCLL <- pca_ll$x[,1]
+df$POSTED_SPEED_LIMIT <- drop(scale(df$POSTED_SPEED_LIMIT))
+```
+```{r}
+pca_ll
+```
+
+```{r}
+sev_target <- factor(df$MOST_SEVERE_INJURY)
+df_severe <- df[,!names(df) %in% c("CRASH_RECORD_ID","CRASH_DATE","DATE_POLICE_NOTIFIED","CRASH_TYPE", "MOST_SEVERE_INJURY", "TRAFFIC_CONTROL_DEVICE", "DAMAGE","INJURIES_TOTAL","INJURIES_FATAL","INJURIES_INCAPACITATING","INJURIES_NON_INCAPACITATING","INJURIES_REPORTED_NOT_EVIDENT","INJURIES_NO_INDICATION", "LATITUDE", "LONGITUDE","CRASH_HOUR","CRASH_DAY_OF_WEEK","CRASH_MONTH","SEASON", "ALIGNMENT")] #, "TRAFFICWAY_TYPE","POSTED_SPEED_LIMIT"
+sev_sm <- sparse.model.matrix( ~ ., data = naref(df_severe))[,-1]
+sev_sm <- sev_sm[,colSums(sev_sm)>0]
+```
+
+
+```{r}
+cl_sev = makeCluster(min(detectCores())-1)
+multifit_sev <- dmr(cl_sev, sev_sm, sev_target, verb=TRUE, lmr=1e-3, cv=TRUE)
+stopCluster(cl_sev)
+```
+
+```{r}
+n_sev <- nrow(sev_sm)
+Bdmr_sev <- coef(multifit_sev)
+pdmr_sev <- predict(Bdmr_sev,sev_sm,type="response")
+trueclassprobs_sev <- pdmr_sev[cbind(1:n_sev, sev_target)]
+plot(trueclassprobs_sev ~ sev_target, col="lavender", varwidth=TRUE,
+xlab="Severity", ylab="prob( true class )")
+par(mfrow=c(2,3))
+for(k in names(multifit_sev)) plot(multifit_sev[[k]], main=k)
+```
+
+
+```{r}
+sev_pred <- predict(Bdmr_sev,sev_sm, type="class")
+confusionMatrix(factor(sev_pred), factor(sev_target),mode="everything")
+```
+
+```{r}
+#roc curve
+multiclass.roc(response=sev_target, predictor=pdmr_sev, plot=TRUE)
+```
+```{r}
+#names of top 5 variables with highest absolute coefficients
+coef_sev <- coef(multifit_sev)
+#coef_sev <- coef_sev[order(abs(coef_sev), decreasing = TRUE)]
+exp(coef_sev[order(coef_sev[,1], decreasing = TRUE)[1:3],1])
+exp(coef_sev[order(coef_sev[,2], decreasing = TRUE)[1:3],2])
+exp(coef_sev[order(coef_sev[,3], decreasing = TRUE)[1:3],3])
+exp(coef_sev[order(coef_sev[,4], decreasing = TRUE)[1:3],4])
+exp(coef_sev[order(coef_sev[,5], decreasing = TRUE)[1:3],5])
+
+```
+
+
+```{r}
+dmg_target <- factor(df$DAMAGE)
+df_damage <- df[,!names(df) %in% c("CRASH_RECORD_ID","CRASH_DATE","DATE_POLICE_NOTIFIED","CRASH_TYPE", "MOST_SEVERE_INJURY", "TRAFFIC_CONTROL_DEVICE", "DAMAGE","INJURIES_TOTAL","INJURIES_FATAL","INJURIES_INCAPACITATING","INJURIES_NON_INCAPACITATING","INJURIES_REPORTED_NOT_EVIDENT","INJURIES_NO_INDICATION","LATITUDE","LONGITUDE","CRASH_HOUR","CRASH_DAY_OF_WEEK","CRASH_MONTH","SEASON", "ALIGNMENT")]
+dmg_sm <- sparse.model.matrix( ~ ., data = naref(df_damage))[,-1]
+dmg_sm <- dmg_sm[,colSums(dmg_sm)>0]
+```
+
+```{r}
+names(df_damage)
+```
+
+```{r}
+cl_dmg = makeCluster(min(detectCores())-1)
+multifit_dmg <- dmr(cl_dmg, dmg_sm, dmg_target, verb=TRUE, lmr=1e-3,cv=TRUE)
+stopCluster(cl_dmg)
+```
+
+```{r}
+n_dmg <- nrow(dmg_sm)
+Bdmr_dmg <- coef(multifit_dmg)
+pdmr_dmg <- predict(Bdmr_dmg,dmg_sm,type="response")
+trueclassprobs_dmg <- pdmr_dmg[cbind(1:n_dmg, dmg_target)]
+plot(trueclassprobs_dmg ~ dmg_target, col="lavender", varwidth=TRUE,
+xlab="Severity", ylab="prob( true class )")
+par(mfrow=c(1,3))
+for(k in names(multifit_dmg)) plot(multifit_dmg[[k]], main=k)
+```
+
+```{r}
+dmg_pred <- predict(Bdmr_dmg,dmg_sm, type="class")
+confusionMatrix(factor(dmg_pred), factor(dmg_target),mode="everything")
+```
+
+```{r}
+#roc curve
+multiclass.roc(response=dmg_target, predictor=pdmr_dmg, plot=TRUE)
+```
+```{r}
+coef_dmg <- coef(multifit_dmg)
+exp(coef_dmg[order(coef_dmg[,1], decreasing = TRUE)[1:3],1])
+exp(coef_dmg[order(coef_dmg[,2], decreasing = TRUE)[1:3],2])
+exp(coef_dmg[order(coef_dmg[,3], decreasing = TRUE)[1:3],3])
+```
+
+```{r}
+sev_target_encoded <- ifelse(sev_target=="FATAL",0,ifelse(sev_target=="INCAPACITATING INJURY",1,ifelse(sev_target=="NO INDICATION OF INJURY",2,ifelse(sev_target=="NONINCAPACITATING INJURY",3,4))))
+sev_param <- list("objective" = "multi:softmax", "num_class" = 5, "eval_metric"="mlogloss")
+XGB_sev <- xgboost(data = sev_sm,
+                  label = sev_target_encoded,
+                  param=sev_param,
+                  nrounds=50,
+                  verbose = FALSE,
+                  nthread = 10)
+```
+
+```{r}
+sev_pred_xgb_encoded <- predict(XGB_sev,sev_sm)
+sev_pred_xgb <- ifelse(sev_pred_xgb_encoded==0,"FATAL",ifelse(sev_pred_xgb_encoded==1,"INCAPACITATING INJURY",ifelse(sev_pred_xgb_encoded==2,"NO INDICATION OF INJURY",ifelse(sev_pred_xgb_encoded==3,"NONINCAPACITATING INJURY","REPORTED, NOT EVIDENT"))))
+confusionMatrix(factor(sev_pred_xgb), factor(sev_target),mode="everything")
+```
+
+```{r}
+sev_importance <- xgb.importance(model = XGB_sev,feature_names = colnames(sev_sm))
+t10_imp_sev <- head(sev_importance,10)
+t10_imp_sev
+```
+
+```{r}
+gp = xgb.ggplot.importance(t10_imp_sev)
+print(gp)
+```
+
+```{r}
+dmg_target_encoded <- ifelse(dmg_target=="$500 OR LESS",0,ifelse(dmg_target=="$501 - $1,500",1,2))
+XGB_dmg <- xgboost(data = dmg_sm,
+                  label = dmg_target_encoded,
+                  objective = "multi:softmax",
+                  num_class = 3,
+                  #eval="mlogloss",
+                  nrounds=50,
+                  #nfold=5,
+                  verbose = FALSE,
+                  #prediction = TRUE,
+                  nthread = 10)
+```
+
+```{r}
+dmg_pred_xgb_encoded <- predict(XGB_dmg,dmg_sm)
+dmg_pred_xgb <- ifelse(dmg_pred_xgb_encoded==0,"$500 OR LESS",ifelse(dmg_pred_xgb_encoded==1,"$501 - $1,500","OVER $1,500"))
+confusionMatrix(factor(dmg_pred_xgb), factor(dmg_target),mode="everything")
+```
+
+```{r}
+dmg_importance <- xgb.importance(model = XGB_dmg,feature_names = colnames(dmg_sm))
+t10_imp_dmg <- head(dmg_importance,10)
+t10_imp_dmg
+```
+```{r}
+gp = xgb.ggplot.importance(t10_imp_dmg)
+print(gp)
+```
